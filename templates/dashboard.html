@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AquaSense Dashboard</title>
+    <style>
+        :root { color-scheme: light; --ink: #17332d; --muted: #536961; --green: #17684f; --line: #dce6e0; }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #f2f6f3; color: var(--ink); font: 15px/1.5 "Instrument Sans", system-ui, sans-serif; }
+        header { background: #123c32; color: #fff; }
+        .wrap { width: min(1160px, calc(100% - 36px)); margin: auto; }
+        .masthead, .section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+        .masthead { padding: 27px 0; }
+        h1, h2, h3, p { margin: 0; }
+        h1 { font-size: clamp(29px, 5vw, 42px); letter-spacing: -.055em; line-height: 1.1; }
+        h2 { font-size: 20px; letter-spacing: -.025em; }
+        h3 { font-size: 16px; }
+        .masthead p { color: #c5ded4; margin-top: 5px; }
+        main { padding: 26px 0 44px; display: grid; gap: 18px; }
+        .muted, dt, th { color: var(--muted); }
+        .section-head { flex-wrap: wrap; margin-bottom: 15px; }
+        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px; margin: 0; }
+        .metric { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+        dt { font-size: 13px; }
+        dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+        .metric dd { font-size: 25px; font-weight: 700; letter-spacing: -.04em; }
+        .layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+        .card { min-width: 0; background: #fff; border: 1px solid var(--line); border-radius: 15px; padding: 20px; }
+        .empty { padding: 22px 14px; background: #f3f7f4; color: var(--muted); border: 1px dashed #cbdcd2; border-radius: 9px; }
+        .chart { display: block; width: 100%; height: auto; }
+        .chart-dates { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; font-size: 12px; }
+        form, .values { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+        label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 4px; }
+        input, select, button, .button { font: inherit; }
+        input, select { width: 100%; min-width: 0; padding: 8px 10px; color: var(--ink); background: #fff; border: 1px solid #b9ccc1; border-radius: 8px; }
+        button, .button { display: inline-block; padding: 9px 14px; background: var(--green); border: 1px solid transparent; border-radius: 8px; color: #fff; font-weight: 650; cursor: pointer; text-decoration: none; }
+        .button { background: transparent; border-color: #79a69a; white-space: nowrap; }
+        button:disabled { opacity: .65; cursor: wait; }
+        :focus-visible { outline: 3px solid #56a88e; outline-offset: 3px; }
+        .form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .error { color: #922b21; }
+        #sandbox-result { margin-top: 14px; padding: 14px; background: #edf7f0; border-radius: 9px; }
+        .values { margin: 10px 0 0; }
+        .values dd { font-weight: 650; }
+        .table-wrap { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; white-space: nowrap; text-align: left; font-variant-numeric: tabular-nums; }
+        th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+        summary { cursor: pointer; font-weight: 650; }
+        details > :not(summary) { margin-top: 10px; }
+        code { overflow-wrap: anywhere; }
+        @media (max-width: 780px) { .layout { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+<header>
+    <div class="wrap masthead">
+        <div><h1>AquaSense</h1><p>Field monitoring and crop prediction</p></div>
+        <a class="button" href="{{ url_for('home') }}">Refresh readings</a>
+    </div>
+</header>
+<main class="wrap">
+    <section aria-labelledby="overview-title">
+        <div class="section-head">
+            <h2 id="overview-title">Latest readings</h2>
+            <span class="muted">{% if latest_reading %}{{ latest_reading.timestamp }} UTC{% else %}Waiting for ESP8266 readings{% endif %}</span>
+        </div>
+        {% set reading = latest_reading %}
+        <dl class="metrics">
+            <div class="metric"><dt>Soil moisture</dt><dd>{{ "%.1f%%"|format(reading.moisture) if reading else "—" }}</dd></div>
+            <div class="metric"><dt>Air temperature</dt><dd>{{ "%.1f °C"|format(reading.temperature) if reading else "—" }}</dd></div>
+            <div class="metric"><dt>Air humidity</dt><dd>{{ "%.1f%%"|format(reading.humidity) if reading else "—" }}</dd></div>
+            <div class="metric"><dt>Distance to surface</dt><dd>{{ "%.1f cm"|format(reading.distance) if reading and reading.distance >= 0 else "—" }}</dd></div>
+            <div class="metric"><dt>Soil type</dt><dd>{{ reading.soil_type if reading else "—" }}</dd></div>
+            <div class="metric"><dt>Saved readings</dt><dd>{{ total_readings }}</dd></div>
+        </dl>
+    </section>
+    <div class="layout">
+        <section class="card" aria-labelledby="chart-title">
+            <div class="section-head"><h2 id="chart-title">Soil moisture</h2><span class="muted">Last 24 hours</span></div>
+            {% if moisture_history %}
+            <canvas id="moisture-chart" class="chart" width="640" height="235"
+                    role="img" aria-label="Soil moisture percentage over time">
+                Latest soil moisture: {{ "%.1f%%"|format(moisture_history[-1][1]) }}
+            </canvas>
+            <div class="chart-dates muted"><span>{{ moisture_history[0][0] }} UTC</span><span>{{ moisture_history[-1][0] }} UTC</span></div>
+            {% else %}
+            <p class="empty">The chart will appear once the ESP8266 sends a reading.</p>
+            {% endif %}
+        </section>
+        <section class="card" aria-labelledby="simulator-title">
+            <div class="section-head"><h2 id="simulator-title">Crop simulator</h2></div>
+            <form id="sandbox-form" data-endpoint="{{ url_for('simulate') }}">
+                <div><label for="temp">Temperature (°C)</label><input id="temp" name="temp" type="number" step="0.1" value="28" required></div>
+                <div><label for="humidity">Humidity (%)</label><input id="humidity" name="humidity" type="number" min="0" max="100" step="0.1" value="55" required></div>
+                <div><label for="soil_moisture">Soil moisture (%)</label><input id="soil_moisture" name="soil_moisture" type="number" min="0" max="100" step="0.1" value="40" required></div>
+                <div><label for="distance">Distance to surface (cm)</label><input id="distance" name="distance" type="number" min="0" step="0.1" value="20"></div>
+                <div><label for="soil_type">Soil type</label>
+                    <select id="soil_type" name="soil_type">
+                        {% for soil in ["Sandy", "Loamy", "Black", "Red", "Clayey"] %}
+                        <option{% if soil == "Loamy" %} selected{% endif %}>{{ soil }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-actions"><button type="submit">Run prediction</button><p id="simulation-status" role="status"></p></div>
+            </form>
+            <div id="sandbox-result" hidden aria-live="polite">
+                <h3 id="res-crop"></h3>
+                <dl class="values">
+                    <div><dt>Method</dt><dd id="res-method"></dd></div>
+                    <div><dt>Prediction score</dt><dd id="res-conf"></dd></div>
+                    <div><dt>Water status</dt><dd id="res-water"></dd></div>
+                    <div><dt>Irrigation</dt><dd id="res-irrigation"></dd></div>
+                </dl>
+            </div>
+        </section>
+    </div>
+    {% if latest_analysis %}
+    <section class="card">
+        <div class="section-head"><h2>Analysis of latest reading</h2></div>
+        <dl class="values">
+            <div><dt>Crop suggestion</dt><dd>{{ latest_analysis.predicted_crop }}</dd></div>
+            {% if latest_analysis.prediction_method %}
+            <div><dt>Method</dt><dd>{{ latest_analysis.prediction_method }}</dd></div>
+            {% endif %}
+            <div><dt>Prediction score</dt><dd>{{ latest_analysis.confidence }}</dd></div>
+            <div><dt>Water status</dt><dd>{{ latest_analysis.water_status }}</dd></div>
+            <div><dt>Irrigation</dt><dd>{{ latest_analysis.irrigation_needed }}</dd></div>
+        </dl>
+        {% set crop = get_crop_details(latest_analysis.predicted_crop) %}
+        <details style="margin-top: 16px">
+            <summary>Crop profile · {{ crop.name }}</summary>
+            <p>{{ crop.description }}</p>
+            <dl class="values">
+                <div><dt>Temperature</dt><dd>{{ crop.optimal_conditions.temperature }}</dd></div>
+                <div><dt>Humidity</dt><dd>{{ crop.optimal_conditions.humidity }}</dd></div>
+                <div><dt>Soil moisture</dt><dd>{{ crop.optimal_conditions.moisture }}</dd></div>
+                <div><dt>Soil type</dt><dd>{{ crop.optimal_conditions.soil }}</dd></div>
+                <div><dt>pH</dt><dd>{{ crop.optimal_conditions.ph }}</dd></div>
+                {% if crop.optimal_conditions.water_table %}
+                <div><dt>Water table</dt><dd>{{ crop.optimal_conditions.water_table }}</dd></div>
+                {% endif %}
+                <div><dt>Growing period</dt><dd>{{ crop.growing_period }}</dd></div>
+                <div><dt>Planting season</dt><dd>{{ crop.planting_season }}</dd></div>
+                <div><dt>Expected yield</dt><dd>{{ crop.yield }}</dd></div>
+                <div><dt>Market value</dt><dd>{{ crop.market_value }}</dd></div>
+            </dl>
+            <ul>{% for tip in crop.care_tips %}<li>{{ tip }}</li>{% endfor %}</ul>
+            <p>{{ crop.nutrition }}</p>
+        </details>
+    </section>
+    {% endif %}
+    <section class="card" aria-labelledby="history-title">
+        <div class="section-head"><h2 id="history-title">Recent readings</h2>{% if recent_logs %}<span class="muted">Latest {{ recent_logs|length }}</span>{% endif %}</div>
+        {% if recent_logs %}
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th scope="col">Time (UTC)</th><th scope="col">Soil moisture</th><th scope="col">Temperature</th><th scope="col">Humidity</th><th scope="col">Soil type</th></tr></thead>
+                <tbody>
+                {% for log in recent_logs|reverse %}
+                <tr><td>{{ log.timestamp }}</td><td>{{ "%.1f%%"|format(log.moisture) }}</td><td>{{ "%.1f °C"|format(log.temperature) }}</td><td>{{ "%.1f%%"|format(log.humidity) }}</td><td>{{ log.soil_type }}</td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="empty">No readings saved yet.</p>
+        {% endif %}
+    </section>
+    <details class="card">
+        <summary>ESP8266 setup</summary>
+        <ol>
+            <li>Set your Wi-Fi credentials in the Arduino sketch.</li>
+            <li>Point the sketch at <code>http://&lt;computer-LAN-IP&gt;:&lt;Flask-port&gt;/data</code> and send JSON with POST.</li>
+            <li>Install the ESP8266 board package, ArduinoJson, and the DHT library, then flash the sketch.</li>
+            <li>Open the Serial Monitor at 115200 baud to check the connection.</li>
+        </ol>
+    </details>
+</main>
+<script>
+    const chart = document.querySelector('#moisture-chart');
+    if (chart) {
+        const readings = {{ moisture_history | tojson }};
+        const context = chart.getContext('2d');
+        const times = readings.map(([time]) => Date.parse(time.replace(' ', 'T') + 'Z'));
+        const start = times[0];
+        const duration = times[times.length - 1] - start;
+        const left = 48;
+        const top = 16;
+        const width = chart.width - left - 16;
+        const height = chart.height - top - 16;
+        const plotY = percent => top + height * (1 - percent / 100);
+
+        context.font = '14px system-ui';
+        for (const percent of [0, 25, 50, 75, 100]) {
+            const y = plotY(percent);
+            context.fillStyle = '#dce6e0';
+            context.fillRect(left, y, width, 1);
+            context.fillStyle = '#536961';
+            context.fillText(percent + '%', 0, y + 4);
+        }
+
+        context.strokeStyle = '#17684f';
+        context.fillStyle = '#17684f';
+        context.lineWidth = 2;
+        context.beginPath();
+        readings.forEach(([, moisture], index) => {
+            const x = left + (duration ? (times[index] - start) / duration : 0.5) * width;
+            const y = plotY(moisture);
+            context.fillRect(x - 2, y - 2, 4, 4);
+            context.lineTo(x, y);
+        });
+        context.stroke();
+    }
+
+    const form = document.querySelector('#sandbox-form');
+    const result = document.querySelector('#sandbox-result');
+    const status = document.querySelector('#simulation-status');
+    const submit = form.querySelector('button');
+    let simulatorUsed = false;
+
+    form.addEventListener('submit', async event => {
+        event.preventDefault();
+        simulatorUsed = true;
+        const fields = new FormData(form);
+        const distance = fields.get('distance');
+        const data = {
+            temp: Number(fields.get('temp')),
+            humidity: Number(fields.get('humidity')),
+            soil_moisture: Number(fields.get('soil_moisture')),
+            distance: distance === '' ? -1 : Number(distance),
+            soil_type: fields.get('soil_type')
+        };
+        result.hidden = true;
+        status.classList.remove('error');
+        status.textContent = 'Running prediction…';
+        submit.disabled = true;
+
+        try {
+            const response = await fetch(form.dataset.endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            const payload = await response.json();
+            if (!response.ok || payload.status !== 'success') {
+                throw new Error('Prediction could not be completed. Try again.');
+            }
+            const analysis = payload.analysis;
+            document.querySelector('#res-crop').textContent = analysis.predicted_crop;
+            document.querySelector('#res-method').textContent = analysis.prediction_method;
+            document.querySelector('#res-conf').textContent = analysis.confidence;
+            document.querySelector('#res-water').textContent = analysis.water_status;
+            document.querySelector('#res-irrigation').textContent = analysis.irrigation_needed;
+            status.textContent = '';
+            result.hidden = false;
+        } catch {
+            status.classList.add('error');
+            status.textContent = 'Prediction could not be completed. Try again.';
+        } finally {
+            submit.disabled = false;
+        }
+    });
+
+    setInterval(() => {
+        if (!simulatorUsed && !form.contains(document.activeElement) && !document.querySelector('details[open]')) {
+            location.reload();
+        }
+    }, 30000);
+</script>
+</body>
+</html>

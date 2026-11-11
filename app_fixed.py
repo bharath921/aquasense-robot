@@ -1,5 +1,10 @@
-from flask import Flask, request, jsonify, render_template_string
-from datetime import datetime
+from flask import Flask, request, jsonify, render_template
+from datetime import datetime, timezone
+from contextlib import closing
+from pathlib import Path
+import json
+from math import isfinite
+import sqlite3
 import traceback
 import pickle
 import os
@@ -7,8 +12,33 @@ import pandas as pd
 
 app = Flask(__name__)
 
-# Store sensor readings
-sensor_data_log = []
+app.config["DATABASE"] = Path(__file__).resolve().with_name("aquasense.sqlite3")
+
+
+def open_database():
+    db = sqlite3.connect(app.config["DATABASE"])
+    with db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                soil_moisture REAL NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS readings_time ON readings (recorded_at)")
+    return db
+
+
+def reading_count(db):
+    return db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+
+
+def recent_readings(db, limit):
+    rows = db.execute(
+        "SELECT payload FROM readings ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [json.loads(payload) for (payload,) in reversed(rows)]
 
 # Load ML model and encoders on startup
 MODEL_PATH = 'crop_predictor.pkl'
@@ -38,11 +68,17 @@ def safe_float(value, default=0.0):
     try:
         if value is None:
             return default
-        return float(value)
+        number = float(value)
+        return number if isfinite(number) else default
     except (TypeError, ValueError):
         return default
 
 def predict_crop(temp, humidity, moisture, soil_type, distance=None):
+    crop, confidence, _ = predict_crop_with_method(temp, humidity, moisture, soil_type, distance)
+    return crop, confidence
+
+
+def predict_crop_with_method(temp, humidity, moisture, soil_type, distance=None):
     """Enhanced crop prediction using ML model with a rule-based fallback"""
     # 1. Try ML Prediction
     if ml_model is not None and soil_encoder is not None and crop_encoder is not None:
@@ -71,11 +107,12 @@ def predict_crop(temp, humidity, moisture, soil_type, distance=None):
             
             # Get confidence
             probabilities = ml_model.predict_proba(features_df)[0]
-            confidence_score = float(probabilities[pred_encoded]) * 100
+            class_index = list(ml_model.classes_).index(pred_encoded)
+            confidence_score = float(probabilities[class_index]) * 100
             confidence = f"{confidence_score:.1f}%"
             
             print(f"[ML] Prediction: {predicted_crop} ({confidence})")
-            return predicted_crop, confidence
+            return predicted_crop, confidence, type(ml_model).__name__
             
         except Exception as ml_err:
             print(f"[WARN] ML prediction failed, falling back to heuristics: {ml_err}")
@@ -140,11 +177,11 @@ def predict_crop(temp, humidity, moisture, soil_type, distance=None):
             confidence = "70% (Rule-based)"
             
         print(f"[INFO] Heuristic Fallback Prediction: {predicted_crop} ({confidence})")
-        return predicted_crop, confidence
+        return predicted_crop, confidence, "Rule-based"
         
     except Exception as e:
         print(f"❌ Crop prediction error: {e}")
-        return "Mixed Farming", "60%"
+        return "Mixed Farming", "60%", "Rule-based"
 
 def analyze_water(moisture, soil_type, humidity, distance=None):
     """Enhanced water analysis with distance-based water table detection"""
@@ -271,308 +308,27 @@ def get_crop_details(crop_name):
         "care_tips": ["🌱 Monitor soil conditions", "💧 Provide adequate water", "🌾 Use appropriate fertilizers"]
     })
 
-WEB_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>🌱 AquaSense Smart Agriculture System</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); padding: 20px; margin: 15px 0; border-radius: 15px; border: 1px solid rgba(255,255,255,0.2); }
-        .status-good { border-left: 5px solid #4CAF50; }
-        .status-warning { border-left: 5px solid #FF9800; }
-        .status-danger { border-left: 5px solid #f44336; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .sensor-reading { font-size: 24px; font-weight: bold; margin: 10px 0; }
-        .timestamp { font-size: 12px; opacity: 0.8; }
-        .endpoint-info { background: rgba(0,0,0,0.3); padding: 15px; border-radius: 10px; margin: 10px 0; }
-        .code { font-family: monospace; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; margin: 5px 0; }
-        .log-entry { background: rgba(0,0,0,0.2); padding: 10px; margin: 5px 0; border-radius: 8px; font-size: 14px; }
-        .refresh-btn { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 10px; }
-        .refresh-btn:hover { background: #45a049; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🌱 AquaSense Smart Agriculture System</h1>
-            <p>Real-time Sensor Monitoring & Crop Prediction</p>
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Data</button>
-        </div>
-        
-        <!-- Live ML Sandbox Simulator -->
-        <div class="card" style="background: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255,255,255,0.3); margin-bottom: 25px;">
-            <h2>🧪 Live ML Model Prediction Sandbox</h2>
-            <p>Manually simulate sensor readings and test the Random Forest Machine Learning model in real-time!</p>
-            <form id="sandbox-form" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-top: 15px;">
-                <div>
-                    <label for="temp" style="display:block; margin-bottom:5px; font-weight:bold; font-size: 14px;">Temperature (°C):</label>
-                    <input type="number" id="temp" name="temp" step="0.1" value="28.0" required style="width:100%; padding:10px; border-radius:8px; border:none; background:rgba(255,255,255,0.2); color:white; font-size:16px; box-sizing: border-box;">
-                </div>
-                <div>
-                    <label for="humidity" style="display:block; margin-bottom:5px; font-weight:bold; font-size: 14px;">Humidity (%):</label>
-                    <input type="number" id="humidity" name="humidity" step="0.1" value="55.0" required style="width:100%; padding:10px; border-radius:8px; border:none; background:rgba(255,255,255,0.2); color:white; font-size:16px; box-sizing: border-box;">
-                </div>
-                <div>
-                    <label for="soil_moisture" style="display:block; margin-bottom:5px; font-weight:bold; font-size: 14px;">Soil Moisture (%):</label>
-                    <input type="number" id="soil_moisture" name="soil_moisture" step="0.1" value="40.0" required style="width:100%; padding:10px; border-radius:8px; border:none; background:rgba(255,255,255,0.2); color:white; font-size:16px; box-sizing: border-box;">
-                </div>
-                <div>
-                    <label for="distance" style="display:block; margin-bottom:5px; font-weight:bold; font-size: 14px;">Water Table Depth (cm):</label>
-                    <input type="number" id="distance" name="distance" step="0.1" value="20.0" style="width:100%; padding:10px; border-radius:8px; border:none; background:rgba(255,255,255,0.2); color:white; font-size:16px; box-sizing: border-box;">
-                </div>
-                <div>
-                    <label for="soil_type" style="display:block; margin-bottom:5px; font-weight:bold; font-size: 14px;">Soil Type:</label>
-                    <select id="soil_type" name="soil_type" style="width:100%; padding:10px; border-radius:8px; border:none; background:rgba(255,255,255,0.2); color:white; font-size:16px; height: 38px; box-sizing: border-box;">
-                        <option value="Sandy" style="background:#764ba2;">Sandy</option>
-                        <option value="Loamy" style="background:#764ba2;" selected>Loamy</option>
-                        <option value="Black" style="background:#764ba2;">Black</option>
-                        <option value="Red" style="background:#764ba2;">Red</option>
-                        <option value="Clayey" style="background:#764ba2;">Clayey</option>
-                    </select>
-                </div>
-                <div style="display: flex; align-items: flex-end;">
-                    <button type="submit" style="width: 100%; background: #4CAF50; color: white; border: none; padding: 10px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; transition: background 0.2s; height: 38px;">Run Inference ⚡</button>
-                </div>
-            </form>
-            <div id="sandbox-result" style="display:none; margin-top:20px; padding:15px; border-radius:10px; background:rgba(0,0,0,0.3); border-left: 5px solid #2196F3;">
-                <h3 style="margin-top:0;">🎯 Model Prediction Output</h3>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
-                    <p style="margin: 5px 0;"><strong>Predicted Crop:</strong> <span id="res-crop" style="font-size:18px; font-weight:bold; color:#4CAF50;"></span></p>
-                    <p style="margin: 5px 0;"><strong>ML Confidence:</strong> <span id="res-conf" style="font-size:18px; font-weight:bold; color:#2196F3;"></span></p>
-                    <p style="margin: 5px 0;"><strong>Water Management:</strong> <span id="res-water"></span></p>
-                    <p style="margin: 5px 0;"><strong>Irrigation Needed:</strong> <span id="res-irrigation"></span></p>
-                </div>
-            </div>
-        </div>
-        
-        <div class="grid">
-            <div class="card">
-                <h2>📡 Server Status</h2>
-                <div class="status-good">
-                    <p><strong>Status:</strong> ✅ Active and Running</p>
-                    <p><strong>Total Readings:</strong> {{ total_readings }}</p>
-                    <p><strong>Last Updated:</strong> {{ current_time }}</p>
-                </div>
-                
-                <div class="endpoint-info">
-                    <h3>🔗 ESP8266 Connection Info</h3>
-                    <p><strong>Send data to:</strong></p>
-                    <div class="code">http://192.168.181.232:5000/data</div>
-                    <p><strong>Method:</strong> POST</p>
-                    <p><strong>Content-Type:</strong> application/json</p>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>📊 Latest Sensor Data</h2>
-                {% if latest_reading %}
-                <div class="sensor-reading">🌡️ Temperature: {{ "%.1f"|format(latest_reading.temperature) }}°C</div>
-                <div class="sensor-reading">💧 Air Humidity: {{ "%.1f"|format(latest_reading.humidity) }}%</div>
-                <div class="sensor-reading">🌱 Soil Moisture: {{ "%.1f"|format(latest_reading.moisture) }}%</div>
-                <div class="sensor-reading" style="border-left: 4px solid #2196F3; padding-left: 15px; background: rgba(33,150,243,0.1);">
-                    🌊 Water Table Depth: {{ "%.1f"|format(latest_reading.distance) }}cm
-                    {% if latest_reading.distance < 15 %}
-                        <span style="color: #4CAF50;"> ✅ Shallow - Good water access</span>
-                    {% elif latest_reading.distance < 30 %}
-                        <span style="color: #FF9800;"> ⚠️ Moderate - Some irrigation needed</span>
-                    {% else %}
-                        <span style="color: #f44336;"> 🚨 Deep - Frequent irrigation required</span>
-                    {% endif %}
-                </div>
-                <div class="sensor-reading">🏔️ Soil Type: {{ latest_reading.soil_type }}</div>
-                <div class="timestamp">{{ latest_reading.timestamp }}</div>
-                {% else %}
-                <p>⏳ Waiting for ESP8266 data...</p>
-                <p>Make sure your ESP8266 is connected and sending data.</p>
-                {% endif %}
-            </div>
-        </div>
-        
-        {% if latest_analysis %}
-        <div class="card status-good">
-            <h2>🤖 AI Analysis Results</h2>
-            <div class="grid">
-                <div>
-                    <h3>🌾 Crop Recommendation</h3>
-                    <p><strong>Recommended:</strong> {{ latest_analysis.predicted_crop }}</p>
-                    <p><strong>Confidence:</strong> {{ latest_analysis.confidence }}</p>
-                </div>
-                <div>
-                    <h3>💧 Water Management</h3>
-                    <p><strong>Status:</strong> {{ latest_analysis.water_status }}</p>
-                    <p><strong>Irrigation:</strong> {{ latest_analysis.irrigation_needed }}</p>
-                </div>
-            </div>
-        </div>
-        {% endif %}
-        
-        <div class="card">
-            <h2>🌾 Recommended Crop Details</h2>
-            {% if sensor_data_log and sensor_data_log[-1].analysis %}
-                {% set crop_name = sensor_data_log[-1].analysis.predicted_crop %}
-                {% set crop_details = get_crop_details(crop_name) %}
-                
-                <div class="status-good">
-                    <h3>{{ crop_details.name }}</h3>
-                    <p><strong>Description:</strong> {{ crop_details.description }}</p>
-                    
-                    <div class="grid" style="margin: 15px 0;">
-                        <div class="endpoint-info">
-                            <h4>🌱 Optimal Growing Conditions</h4>
-                            <p><strong>Temperature:</strong> {{ crop_details.optimal_conditions.temperature }}</p>
-                            <p><strong>Humidity:</strong> {{ crop_details.optimal_conditions.humidity }}</p>
-                            <p><strong>Soil Moisture:</strong> {{ crop_details.optimal_conditions.moisture }}</p>
-                            <p><strong>Soil Type:</strong> {{ crop_details.optimal_conditions.soil }}</p>
-                            <p><strong>pH Level:</strong> {{ crop_details.optimal_conditions.ph }}</p>
-                            {% if crop_details.optimal_conditions.water_table %}
-                            <p><strong>🌊 Water Table:</strong> {{ crop_details.optimal_conditions.water_table }}</p>
-                            {% endif %}
-                        </div>
-                        
-                        <div class="endpoint-info">
-                            <h4>📊 Crop Information</h4>
-                            <p><strong>Growing Period:</strong> {{ crop_details.growing_period }}</p>
-                            <p><strong>Planting Season:</strong> {{ crop_details.planting_season }}</p>
-                            <p><strong>Expected Yield:</strong> {{ crop_details.yield }}</p>
-                            <p><strong>Market Value:</strong> {{ crop_details.market_value }}</p>
-                        </div>
-                    </div>
-                    
-                    <div class="endpoint-info">
-                        <h4>💡 Care Tips & Best Practices</h4>
-                        {% for tip in crop_details.care_tips %}
-                            <p>• {{ tip }}</p>
-                        {% endfor %}
-                    </div>
-                    
-                    <div class="code">
-                        <strong>🥗 Nutritional Information:</strong><br>
-                        {{ crop_details.nutrition }}
-                    </div>
-                </div>
-            {% else %}
-                <p>🔄 Crop details will appear here once sensor data is received and analyzed.</p>
-                <p>Connect your ESP8266 to see personalized crop recommendations!</p>
-                
-                <div class="endpoint-info">
-                    <h4>🌾 Available Crop Database</h4>
-                    <p>Our system can provide detailed information for:</p>
-                    <div class="code">
-                        Rice • Wheat • Bajra (Pearl Millet) • Maize • Cotton<br>
-                        Sugarcane • Potato • Groundnut • And many more...
-                    </div>
-                </div>
-            {% endif %}
-        </div>
-        
-        <div class="card">
-            <h2>📋 Recent Activity Log</h2>
-            <div style="max-height: 400px; overflow-y: auto;">
-                {% for log in recent_logs %}
-                <div class="log-entry">
-                    <strong>{{ log.timestamp }}</strong> - 
-                    🌡️{{ "%.1f"|format(log.temperature) }}°C, 
-                    💧{{ "%.1f"|format(log.humidity) }}%, 
-                    🌱{{ "%.1f"|format(log.moisture) }}%
-                </div>
-                {% endfor %}
-                {% if not recent_logs %}
-                <p>No data received yet. ESP8266 will appear here when connected.</p>
-                {% endif %}
-            </div>
-        </div>
-        
-        <div class="card">
-            <h2>⚙️ ESP8266 Setup Instructions</h2>
-            <ol>
-                <li><strong>Update WiFi credentials</strong> in the Arduino code:
-                    <div class="code">
-                        const char* ssid = "YOUR_WIFI_NAME";<br>
-                        const char* password = "YOUR_WIFI_PASSWORD";
-                    </div>
-                </li>
-                <li><strong>Install required libraries</strong> in Arduino IDE:
-                    <div class="code">ESP8266WiFi, ArduinoJson, DHT</div>
-                </li>
-                <li><strong>Upload the code</strong> to your ESP8266</li>
-                <li><strong>Open Serial Monitor</strong> (115200 baud) to see output</li>
-                <li><strong>Data will appear</strong> on this page automatically!</li>
-            </ol>
-        </div>
-    </div>
-    
-    <script>
-        // Sandbox Form Submission
-        document.getElementById('sandbox-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const data = {
-                temp: parseFloat(document.getElementById('temp').value),
-                humidity: parseFloat(document.getElementById('humidity').value),
-                soil_moisture: parseFloat(document.getElementById('soil_moisture').value),
-                distance: parseFloat(document.getElementById('distance').value) || -1.0,
-                soil_type: document.getElementById('soil_type').value
-            };
-            
-            fetch('/data', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(res => {
-                if (res.status === 'success') {
-                    document.getElementById('res-crop').innerText = res.analysis.predicted_crop;
-                    document.getElementById('res-conf').innerText = res.analysis.confidence;
-                    document.getElementById('res-water').innerText = res.analysis.water_status;
-                    document.getElementById('res-irrigation').innerText = res.analysis.irrigation_needed;
-                    document.getElementById('sandbox-result').style.display = 'block';
-                    
-                    // Reload page after a short delay to update other parts of the dashboard
-                    setTimeout(() => {
-                        location.reload();
-                    }, 1500);
-                } else {
-                    alert('Prediction failed: ' + res.message);
-                }
-            })
-            .catch(err => {
-                alert('Error connecting to server: ' + err);
-            });
-        });
-
-        // Auto-refresh every 30 seconds, but only if user is not interacting with inputs
-        setInterval(function() {
-            if (document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') {
-                location.reload();
-            }
-        }, 30000);
-        
-        console.log("🌱 AquaSense Dashboard Loaded");
-    </script>
-</body>
-</html>
-"""
-
 @app.route('/', methods=['GET'])
 def home():
     """Home page with real-time dashboard"""
+    with closing(open_database()) as db:
+        sensor_data_log = recent_readings(db, 10)
+        total_readings = reading_count(db)
+        moisture_history = db.execute("""
+            SELECT recorded_at, soil_moisture FROM readings
+            WHERE recorded_at >= datetime('now', '-1 day')
+            ORDER BY recorded_at, id
+        """).fetchall()
     latest_reading = sensor_data_log[-1] if sensor_data_log else None
-    latest_analysis = getattr(latest_reading, 'analysis', None) if latest_reading else None
+    latest_analysis = latest_reading["analysis"] if latest_reading else None
     
-    return render_template_string(WEB_TEMPLATE, 
-        total_readings=len(sensor_data_log),
-        current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    return render_template(
+        "dashboard.html",
+        total_readings=total_readings,
+        moisture_history=moisture_history,
         latest_reading=latest_reading,
         latest_analysis=latest_analysis,
-        recent_logs=sensor_data_log[-10:] if sensor_data_log else [],
-        sensor_data_log=sensor_data_log,
+        recent_logs=sensor_data_log,
         get_crop_details=get_crop_details
     )
 
@@ -600,6 +356,7 @@ def test():
             })
 
 @app.route('/data', methods=['POST'])
+@app.route('/simulate', methods=['POST'], endpoint='simulate')
 def receive_data():
     """Receive sensor data from ESP8266"""
     try:
@@ -619,9 +376,9 @@ def receive_data():
             return jsonify({"error": "Invalid JSON"}), 400
         
         # Extract values safely
-        temp = safe_float(data.get("temp") or data.get("temperature"), 25.0)
+        temp = safe_float(data.get("temp", data.get("temperature")), 25.0)
         humidity = safe_float(data.get("humidity"), 50.0)
-        moisture = safe_float(data.get("soil_moisture") or data.get("moisture"), 0.1)
+        moisture = safe_float(data.get("soil_moisture", data.get("moisture")), 0.1)
         distance = safe_float(data.get("distance"), -1.0)
         soil_type = str(data.get("soil_type", "Loamy"))
         
@@ -633,17 +390,19 @@ def receive_data():
         print(f"   Soil Type: {soil_type}")
         
         # Handle edge cases
-        if moisture <= 0:
-            print("[WARN] Moisture is zero or negative, setting to 0.1%")
+        if moisture < 0:
+            print("[WARN] Moisture is negative, setting to 0.1%")
             moisture = 0.1
             
         # Make predictions with distance integration
-        crop, confidence = predict_crop(temp, humidity, moisture, soil_type, distance)
+        crop, confidence, prediction_method = predict_crop_with_method(
+            temp, humidity, moisture, soil_type, distance
+        )
         water_status, irrigation, water_table = analyze_water(moisture, soil_type, humidity, distance)
         
         # Store record with analysis
         record = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "temperature": temp,
             "humidity": humidity,
             "moisture": moisture,
@@ -652,6 +411,7 @@ def receive_data():
             "raw_data": data,
             "analysis": {
                 "predicted_crop": crop,
+                "prediction_method": prediction_method,
                 "confidence": confidence,
                 "water_status": water_status,
                 "irrigation_needed": irrigation,
@@ -659,11 +419,13 @@ def receive_data():
             }
         }
         
-        sensor_data_log.append(record)
-        if len(sensor_data_log) > 100:
-            sensor_data_log.pop(0)
-        
-        print(f"[INFO] Stored record #{len(sensor_data_log)}")
+        with closing(open_database()) as db, db:
+            if request.path == "/data":
+                db.execute("""
+                    INSERT INTO readings (recorded_at, soil_moisture, payload)
+                    VALUES (?, ?, ?)
+                """, (record["timestamp"], moisture, json.dumps(record)))
+            total_readings = reading_count(db)
         print(f"[INFO] Predictions:")
         print(f"   Crop: {crop} (Confidence: {confidence})")
         print(f"   Water: {water_status}")
@@ -682,12 +444,13 @@ def receive_data():
             },
             "analysis": {
                 "predicted_crop": crop,
+                "prediction_method": prediction_method,
                 "confidence": confidence,
                 "water_status": water_status,
                 "irrigation_needed": irrigation,
                 "water_table_estimate": water_table
             },
-            "total_readings": len(sensor_data_log)
+            "total_readings": total_readings
         }
         
         print("[INFO] Sending successful response")
@@ -708,13 +471,16 @@ def receive_data():
         
         print(f"[ERROR] Sending error response: {error_response}")
         print("="*50 + "\n")
-        return jsonify(error_response), 200  # Return 200 to help ESP8266
+        return jsonify(error_response), 500
 
 @app.route('/logs', methods=['GET'])
 def get_logs():
-    """Get all sensor data logs"""
+    """Get the latest 100 readings and the lifetime count."""
+    with closing(open_database()) as db:
+        sensor_data_log = recent_readings(db, 100)
+        total_readings = reading_count(db)
     return jsonify({
-        "total_readings": len(sensor_data_log),
+        "total_readings": total_readings,
         "latest_readings": sensor_data_log[-10:] if sensor_data_log else [],
         "all_readings": sensor_data_log
     })
